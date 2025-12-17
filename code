@@ -1,0 +1,216 @@
+import pandas as pd
+from urllib.parse import urlparse
+
+# ==========================
+# 1. CONFIG – CHANGE THESE
+# ==========================
+
+MERK_FILE = "Legal Merk export - general.csv"      # Merk export
+SFDC_FILE = "report1765934672117.csv"             # SFDC export
+OUTPUT_FILE = "merk_net_new_deduped_for_sfdc.csv"
+
+# Column names in MERK export (adjust if your headers differ)
+MERK_COL_COMPANY             = "Subject name"
+MERK_COL_EMAIL               = "E-mail"
+MERK_COL_HEADCOUNT_RANGE     = "Employees"               # range text
+MERK_COL_PHONE               = "Phone"
+MERK_COL_MOBILE              = "Mobile"
+MERK_COL_CITY                = "Municipality"
+MERK_COL_REGNO               = "Reg. no."
+MERK_COL_SUB_INDUSTRY        = "Major industry category"
+MERK_COL_WEBSITE             = "Website"
+MERK_COL_TITLE               = "Contact person 1 Position"  # or another contact column
+
+# Column names in SFDC export (adjust if needed)
+SFDC_COL_REGNO               = "Company Registration Code"
+SFDC_COL_WEBSITE             = "Website"
+SFDC_COL_EMAIL               = "Email"   # used to derive domain if Website missing
+
+# Constant(s)
+DEFAULT_COUNTRY = "Czech Republic"
+
+# =====================================
+# 2. HELPER FUNCTIONS (NORMALIZATION)
+# =====================================
+
+def normalize_regno(value):
+    """Normalize registration number as string without spaces, strip .0."""
+    if pd.isna(value):
+        return None
+    s = str(value).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    s = s.replace(" ", "").replace("\u00a0", "")
+    return s or None
+
+def extract_domain_from_url(url):
+    """Extract domain from URL, strip www."""
+    if pd.isna(url):
+        return None
+    s = str(url).strip()
+    if not s:
+        return None
+    if not s.startswith("http://") and not s.startswith("https://"):
+        s = "http://" + s  # add scheme to make urlparse work
+    try:
+        parsed = urlparse(s)
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host or None
+    except Exception:
+        return None
+
+def extract_domain_from_email(email):
+    """Extract domain from email (part after @)."""
+    if pd.isna(email):
+        return None
+    s = str(email).strip()
+    if "@" not in s:
+        return None
+    return s.split("@", 1)[1].lower()
+
+def normalize_phone(value):
+    """Keep phone as string, remove .0 and trim."""
+    if pd.isna(value):
+        return None
+    s = str(value).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    s = s.replace("\u00a0", " ")
+    return s or None
+
+# ==============================
+# 3. LOAD INPUT FILES
+# ==============================
+
+print("Loading CSV files...")
+merk_df = pd.read_csv(MERK_FILE)
+sfdc_df = pd.read_csv(SFDC_FILE)
+
+# ==============================
+# 4. PREPARE SFDC KEYS
+# ==============================
+
+print("Preparing SFDC keys (regno + domain)...")
+sfdc_df["regno_norm"] = sfdc_df[SFDC_COL_REGNO].apply(normalize_regno)
+
+# Prefer Website domain; if missing, derive from Email
+sfdc_df["website_domain_norm"] = sfdc_df[SFDC_COL_WEBSITE].apply(extract_domain_from_url)
+sfdc_df["email_domain_norm"] = sfdc_df[SFDC_COL_EMAIL].apply(extract_domain_from_email)
+
+# If website_domain_norm missing, backfill from email domain
+sfdc_df["domain_norm"] = sfdc_df["website_domain_norm"].fillna(sfdc_df["email_domain_norm"])
+
+existing_regnos = set(filter(None, sfdc_df["regno_norm"].tolist()))
+existing_domains = set(filter(None, sfdc_df["domain_norm"].tolist()))
+
+print(f"Existing SFDC regnos: {len(existing_regnos)}")
+print(f"Existing SFDC domains: {len(existing_domains)}")
+
+# ==============================
+# 5. PREPARE MERK KEYS
+# ==============================
+
+print("Preparing Merk keys...")
+merk_df["regno_norm"] = merk_df[MERK_COL_REGNO].apply(normalize_regno)
+merk_df["domain_norm"] = merk_df[MERK_COL_WEBSITE].apply(extract_domain_from_url)
+
+# ==============================
+# 6. FLAG EXISTING VS NET-NEW
+# ==============================
+
+def is_existing(row):
+    r = row["regno_norm"]
+    d = row["domain_norm"]
+    if r and r in existing_regnos:
+        return True
+    if d and d in existing_domains:
+        return True
+    return False
+
+print("Flagging existing vs net-new...")
+merk_df["is_existing_sfdc"] = merk_df.apply(is_existing, axis=1)
+
+merk_existing = merk_df[merk_df["is_existing_sfdc"] == True].copy()
+merk_new      = merk_df[merk_df["is_existing_sfdc"] == False].copy()
+
+print(f"Total Merk rows: {len(merk_df)}")
+print(f"Existing in SFDC: {len(merk_existing)}")
+print(f"Net-new companies: {len(merk_new)}")
+
+# ==============================
+# 7. DEDUPE INSIDE MERK NET-NEW
+# ==============================
+
+print("Deduplicating net-new Merk rows...")
+
+def make_dedupe_key(row):
+    r = row["regno_norm"]
+    d = row["domain_norm"]
+    if r:
+        return f"REG:{r}"
+    if d:
+        return f"DOM:{d}"
+    # Fallback: combination of name + city
+    company = str(row.get(MERK_COL_COMPANY, "")).strip().lower()
+    city = str(row.get(MERK_COL_CITY, "")).strip().lower()
+    return f"NAMECITY:{company}|{city}"
+
+merk_new["dedupe_key"] = merk_new.apply(make_dedupe_key, axis=1)
+
+# Keep first occurrence of each dedupe_key
+merk_new_deduped = merk_new.sort_index().drop_duplicates(subset=["dedupe_key"], keep="first")
+
+print(f"Net-new after internal dedupe: {len(merk_new_deduped)}")
+
+# ==============================
+# 8. BUILD FINAL OUTPUT DF
+# ==============================
+
+print("Building output dataframe...")
+
+output = pd.DataFrame()
+
+output["Company"] = merk_new_deduped[MERK_COL_COMPANY]
+
+# Email (company-level email)
+output["Email"] = merk_new_deduped.get(MERK_COL_EMAIL)
+
+# Head Count (range string from Merk)
+output["Head Count"] = merk_new_deduped.get(MERK_COL_HEADCOUNT_RANGE)
+
+# Exact NumberOfEmployees – left empty since Merk provides ranges only
+output["NumberOfEmployees"] = None
+
+# Title – contact person title where available
+output["Title"] = merk_new_deduped.get(MERK_COL_TITLE)
+
+# Phones
+output["Phone"] = merk_new_deduped[MERK_COL_PHONE].apply(normalize_phone) \
+                    if MERK_COL_PHONE in merk_new_deduped.columns else None
+output["MobilePhone"] = merk_new_deduped[MERK_COL_MOBILE].apply(normalize_phone) \
+                    if MERK_COL_MOBILE in merk_new_deduped.columns else None
+
+# Country (constant)
+output["Country"] = DEFAULT_COUNTRY
+
+# City
+output["City"] = merk_new_deduped.get(MERK_COL_CITY)
+
+# Company Registration Code
+output["Company Registration Code"] = merk_new_deduped["regno_norm"]
+
+# Sub Industry
+output["Sub Industry"] = merk_new_deduped.get(MERK_COL_SUB_INDUSTRY)
+
+# Website
+output["Website"] = merk_new_deduped.get(MERK_COL_WEBSITE)
+
+# ==============================
+# 9. SAVE OUTPUT
+# ==============================
+
+print(f"Saving to {OUTPUT_FILE} ...")
+output.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+print("Done.")
